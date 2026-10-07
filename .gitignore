@@ -1,0 +1,39 @@
+# Compiled object files
+*.slo
+*.lo
+*.o
+*.obj
+build/
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Compiled dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+bin/*.zip
+
+tests/
+.vs/*
+.vscode/*
+bin/minqlxtended-plugins/
+/minqlxtended-plugins
+*.pyc
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
