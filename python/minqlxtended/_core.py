@@ -36,6 +36,7 @@ import logging
 import atexit
 import queue
 import shlex
+import re
 import sys
 import os
 import gc
@@ -482,6 +483,21 @@ def set_cvar_limit_once(name: str, value: Any, minimum: Any, maximum: Any,
     return False
 
 
+def _archive_plugins_version(path: str) -> str:
+    name = minqlxtended.get_cvar("qlx_pluginsVersionFile")
+    if not name or name in (".", "..") or os.path.basename(name) != name:
+        return "NOT_SET"
+    try:
+        with open(os.path.join(path, name), "rb") as receipt:
+            header = receipt.readline(257)
+    except OSError:
+        return "NOT_SET"
+    if len(header) > 256:
+        return "NOT_SET"
+    match = re.search(rb"(?:^|[ \t])payload ([0-9a-f]{64})(?=[, \t\r\n]|$)", header)
+    return "payload-" + match.group(1)[:12].decode("ascii") if match else "NOT_SET"
+
+
 def set_plugins_version(path: str) -> None:
     args_version = shlex.split("git describe --long --tags --dirty --always")
     args_branch = shlex.split("git rev-parse --abbrev-ref HEAD")
@@ -494,7 +510,7 @@ def set_plugins_version(path: str) -> None:
         p = subprocess.Popen(args_version, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=path, env=env)
         p.wait(timeout=1)
         if p.returncode != 0:
-            _set_plugins_version("NOT_SET")
+            _set_plugins_version(_archive_plugins_version(path))
             return
 
         assert p.stdout is not None  # opened with stdout=PIPE
@@ -510,7 +526,7 @@ def set_plugins_version(path: str) -> None:
         assert p.stdout is not None  # opened with stdout=PIPE
         branch = p.stdout.read().decode().strip()
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        _set_plugins_version("NOT_SET")
+        _set_plugins_version(_archive_plugins_version(path))
         return
 
     _set_plugins_version(f"{version}-{branch}")
@@ -1153,6 +1169,7 @@ def initialize_cvars() -> None:
     set_cvar_once("qlx_owner", "-1")
     set_cvar_once("qlx_plugins", ", ".join(DEFAULT_PLUGINS))
     set_cvar_once("qlx_pluginsPath", "minqlxtended-plugins")
+    set_cvar_once("qlx_pluginsVersionFile", "")
     set_cvar_once("qlx_database", "Redis")
     set_cvar_once("qlx_commandPrefix", "!")
     set_cvar_once("qlx_logs", "2")

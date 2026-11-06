@@ -3,10 +3,17 @@
 
 This is a modified version of minqlxtended by Thomas Jones
 (https://github.com/tjone270/minqlxtended), based on tag v1.1.0.
-Modified by PlayQuake on 2026-10-07. Changes:
+Modified by PlayQuake on 2026-11-06. Changes:
 
 - New `damage_applied` event: the health plus armour that each hit removes.
 - `CORE_MODULE` can be set at build time to an absolute path.
+- `qlx_pluginsVersionFile` identifies an archive plugin set without Git.
+- Bots are dropped before the server restarts itself in the same process, so server
+  queries no longer list the bots from before the restart.
+- The zmq RCON socket has a send timeout of 0: an RCON client whose send queue is full
+  is forgotten. Its next message re-registers it and is not run.
+- The RCON receive discards the extra frames of a message, so each read starts at a
+  message boundary.
 
 Licensed under GPL-3.0-or-later, as the original. See LICENSE.
 <!-- modification-notice:end -->

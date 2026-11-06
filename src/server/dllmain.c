@@ -85,6 +85,17 @@ Sys_IsLANAddress_ptr Sys_IsLANAddress;
 idSteamServer_DownloadItem_ptr idSteamServer_DownloadItem;
 SV_LinkEntity_ptr SV_LinkEntity;
 SV_UnlinkEntity_ptr SV_UnlinkEntity;
+ZMQ_RconBroadcast_ptr ZMQ_RconBroadcast;
+zsock_set_sndtimeo_ptr zsock_set_sndtimeo;
+void** zmq_rcon_sock;
+ZMQ_RconReceive_ptr ZMQ_RconReceive;
+zsock_rcvmore_ptr zsock_rcvmore;
+zsock_resolve_ptr zsock_resolve;
+zmq_msg_init_ptr zmq_msg_init;
+zmq_recvmsg_ptr zmq_recvmsg;
+zmq_msg_close_ptr zmq_msg_close;
+// Used only to derive the four primitives above; not hooked, so its bytes stay put.
+static zstr_recv_ptr zstr_recv;
 
 // VM functions
 G_RunFrame_ptr G_RunFrame;
@@ -166,6 +177,16 @@ void DebugError(const char* fmt, const char* file, int line, const char* func, .
     } else                                             \
         DebugPrint(#x ": %p\n", x)
 
+// Reads the target of a `call rel32` (opcode 0xE8) at call_site, checked against the image. The
+// RCON receive drain derives its primitives from the calls inside zstr_recv this way.
+static void* ResolveCallTarget(pint call_site) {
+    if (!call_site || *(uint8_t*)call_site != 0xE8) {
+        return NULL;
+    }
+    pint target = call_site + 5 + (pint)(*(int32_t*)(call_site + 1));
+    return InImage(target) ? (void*)target : NULL;
+}
+
 static void SearchFunctions(void) {
     int failed = 0;
     module_info_t module;
@@ -222,6 +243,80 @@ static void SearchFunctions(void) {
         DebugPrint("WARNING: Unable to find SV_UnlinkEntity. unlink_entity() will not be available.\n");
     } else {
         DebugPrint("SV_UnlinkEntity: %p\n", SV_UnlinkEntity);
+    }
+
+    /*
+     * Tolerated misses: the zmq RCON send timeout needs all three, and the server runs without
+     * it. The socket slot is read from the broadcast's code here, before HookStatic() overwrites
+     * that code.
+     */
+    ZMQ_RconBroadcast  = (ZMQ_RconBroadcast_ptr)PatternSearchModule(&module, PTRN_ZMQ_RCONBROADCAST, MASK_ZMQ_RCONBROADCAST);
+    zsock_set_sndtimeo = (zsock_set_sndtimeo_ptr)PatternSearchModule(&module, PTRN_ZSOCK_SET_SNDTIMEO, MASK_ZSOCK_SET_SNDTIMEO);
+    zmq_rcon_sock      = NULL;
+    if (ZMQ_RconBroadcast != NULL) {
+        pint candidate = *(int32_t*)OFFSET_RELP_ZMQ_RCON_SOCK + OFFSET_RELP_ZMQ_RCON_SOCK + 4;
+        if (InImage(candidate)) {
+            zmq_rcon_sock = (void**)candidate;
+        }
+    }
+    if (ZMQ_RconBroadcast == NULL || zsock_set_sndtimeo == NULL || zmq_rcon_sock == NULL) {
+        DebugPrint("WARNING: Unable to resolve the zmq RCON broadcast; the RCON broadcast runs as the engine ships.\n");
+        ZMQ_RconBroadcast  = NULL;
+        zsock_set_sndtimeo = NULL;
+        zmq_rcon_sock      = NULL;
+    } else {
+        DebugPrint("ZMQ_RconBroadcast: %p\n", ZMQ_RconBroadcast);
+        DebugPrint("zsock_set_sndtimeo: %p\n", zsock_set_sndtimeo);
+        DebugPrint("zmq_rcon_sock: %p\n", zmq_rcon_sock);
+    }
+
+    /*
+     * Tolerated misses: the RCON receive drain needs the whole set, and the server runs without
+     * it. zstr_recv is matched only to derive the four primitives it calls; it is not hooked.
+     */
+    ZMQ_RconReceive = (ZMQ_RconReceive_ptr)PatternSearchModule(&module, PTRN_ZMQ_RCONRECEIVE, MASK_ZMQ_RCONRECEIVE);
+    zstr_recv       = (zstr_recv_ptr)PatternSearchModule(&module, PTRN_ZSTR_RECV, MASK_ZSTR_RECV);
+    zsock_rcvmore   = (zsock_rcvmore_ptr)PatternSearchModule(&module, PTRN_ZSOCK_RCVMORE, MASK_ZSOCK_RCVMORE);
+    zsock_resolve   = NULL;
+    zmq_msg_init    = NULL;
+    zmq_recvmsg     = NULL;
+    zmq_msg_close   = NULL;
+    if (zstr_recv != NULL) {
+        zsock_resolve = (zsock_resolve_ptr)ResolveCallTarget(OFFSET_CALL_ZSOCK_RESOLVE);
+        zmq_msg_init  = (zmq_msg_init_ptr)ResolveCallTarget(OFFSET_CALL_ZMQ_MSG_INIT);
+        zmq_recvmsg   = (zmq_recvmsg_ptr)ResolveCallTarget(OFFSET_CALL_ZMQ_RECVMSG);
+        zmq_msg_close = (zmq_msg_close_ptr)ResolveCallTarget(OFFSET_CALL_ZMQ_MSG_CLOSE);
+    }
+    if (ZMQ_RconReceive == NULL || zstr_recv == NULL || zsock_rcvmore == NULL ||
+        zsock_resolve == NULL || zmq_msg_init == NULL || zmq_recvmsg == NULL ||
+        zmq_msg_close == NULL || zmq_rcon_sock == NULL) {
+        DebugPrint("WARNING: Unable to resolve the zmq RCON receive drain; the RCON receive runs as the engine ships.\n");
+        ZMQ_RconReceive = NULL;
+        zsock_rcvmore   = NULL;
+        zsock_resolve   = NULL;
+        zmq_msg_init    = NULL;
+        zmq_recvmsg     = NULL;
+        zmq_msg_close   = NULL;
+    } else {
+        // The drain reads *zmq_rcon_sock, the slot 0007 derives from the broadcast. The receive's
+        // own prologue is `cmp qword [rip+disp32], 0` (8 bytes); its disp32 must name that same
+        // slot, or the drain would act on a different socket. recv+8 is the rip base; recv+3 holds
+        // the disp32. Verify it and stay stock on a mismatch.
+        pint recv = (pint)ZMQ_RconReceive;
+        void** recv_slot = (void**)(recv + 8 + *(int32_t*)(recv + 3));
+        if (recv_slot != zmq_rcon_sock) {
+            DebugPrint("WARNING: the zmq RCON receive names a different socket slot; the RCON receive runs as the engine ships.\n");
+            ZMQ_RconReceive = NULL;
+            zsock_rcvmore   = NULL;
+            zsock_resolve   = NULL;
+            zmq_msg_init    = NULL;
+            zmq_recvmsg     = NULL;
+            zmq_msg_close   = NULL;
+        } else {
+            DebugPrint("ZMQ_RconReceive: %p\n", ZMQ_RconReceive);
+            DebugPrint("zsock_rcvmore: %p\n", zsock_rcvmore);
+            DebugPrint("zsock_resolve: %p\n", zsock_resolve);
+        }
     }
 
     // Cmd_Argc is too small to search for, so this follows a reference to it. It gets the same

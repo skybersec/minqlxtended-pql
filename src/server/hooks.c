@@ -192,6 +192,8 @@ void __cdecl My_SV_DropClient(client_t* drop, const char* reason) {
     SV_DropClient(drop, reason);
 }
 
+static void RconBroadcastGuardRecover(void); // release a RCON broadcast guard a longjmp leaked
+
 void __cdecl My_SV_SpawnServer(char* server, qboolean killBots) {
 #ifndef NOPY
     // Backstop under console_command()'s classifier. Getting here from a command it ran in place
@@ -213,6 +215,7 @@ void __cdecl My_SV_SpawnServer(char* server, qboolean killBots) {
     Scoreboard_Reset(); // ...as does anything we were part-way through trimming
 #endif
 
+    RconBroadcastGuardRecover(); // past the in-place deferral: the main thread is not broadcasting here
     Demo_CloseAll(); // map change: finalise open demos; each client re-primes with a fresh gamestate
     Stream_CloseAll();
 
@@ -705,6 +708,48 @@ void __cdecl My_G_RunFrame(int time) {
     PROF_END(PROF_FRAME_TOTAL, t_frame);
 }
 
+// SV_Frame shuts the server down with one of these messages and then runs "vstr nextmap", so the
+// process stays up and loads a map again (@qzeroded 0x43e938). SV_Shutdown drops no clients, so a
+// bot keeps its entry in the Steam user list that server queries report, and the next map adds
+// a fresh set of bots on top of it. The engine's SV_DropClient ends that entry, for a bot too.
+// The messages must match the engine's strings byte for byte.
+static const char* const restart_messages[] = {
+    "Restarting idle server",
+    "Restarting server due to time wrapping",
+    "Restarting server due to numSnapshotEntities wrapping",
+};
+
+// Drops every bot through the unhooked SV_DropClient, so no player_disconnect dispatch runs while
+// the server shuts down. Human clients stay with SV_Shutdown, as before.
+static void DropBotsBeforeRestart(const char* finalmsg) {
+    int restart = 0;
+    if (!finalmsg) {
+        return;
+    }
+    for (size_t i = 0; i < sizeof(restart_messages) / sizeof(restart_messages[0]); i++) {
+        if (!strcmp(finalmsg, restart_messages[i])) {
+            restart = 1;
+            break;
+        }
+    }
+    if (!restart || !svs || !svs->clients || !sv_maxclients) {
+        return;
+    }
+
+    int dropped = 0;
+    for (int c = 0; c < sv_maxclients->integer; c++) {
+        client_t* cl = &svs->clients[c];
+        if (cl->state < CS_CONNECTED || !cl->gentity || !(cl->gentity->r.svFlags & SVF_BOT)) {
+            continue;
+        }
+        SV_DropClient(cl, finalmsg);
+        dropped++;
+    }
+    if (dropped) {
+        DebugPrint("%d bot(s) dropped before restart: %s\n", dropped, finalmsg);
+    }
+}
+
 // The server going away: `quit`, `killserver` and sv_killserver, Com_Error, and SV_Frame's
 // restart paths. SV_SpawnServer does not come through here, so this can finalise
 // unconditionally. Runs before the original, which Z_Free's svs.clients and then memsets svs.
@@ -727,6 +772,9 @@ void __cdecl My_SV_Shutdown(char* finalmsg) {
         return;
     }
 #endif
+
+    // Below the deferral, and before the original frees the client array.
+    DropBotsBeforeRestart(finalmsg);
 
     // Below the deferral, which returns with the server still up. From here it is going away, so
     // anything a longjmp left standing is stale: a spawn depth, and whatever we were part-way
@@ -752,6 +800,89 @@ void __cdecl My_SV_Shutdown(char* finalmsg) {
 #endif
 
     SV_Shutdown(finalmsg);
+}
+
+// My_ZMQ_RconBroadcast sets a zero send timeout on the engine's zmq RCON socket before the first
+// send, so a send to a peer whose queue is full is dropped. The engine creates the socket once,
+// from main (@qzeroded 0x44bfa0), and this broadcast is its only sender.
+static void* rcon_sock_with_timeout;
+// One global guard runs a single broadcast at a time across threads; it skips a nested or
+// concurrent broadcast. rcon_broadcast_held marks the holding thread, so the main thread can
+// release a guard left set after a longjmp (see RconBroadcastGuardRecover).
+static volatile unsigned char rcon_broadcast_active;
+static _Thread_local int rcon_broadcast_held;
+
+void __cdecl My_ZMQ_RconBroadcast(const char* text) {
+    if (__atomic_test_and_set(&rcon_broadcast_active, __ATOMIC_ACQUIRE)) {
+        return;
+    }
+    rcon_broadcast_held = 1;
+
+    void* sock = *zmq_rcon_sock;
+    if (sock && sock != rcon_sock_with_timeout) {
+        zsock_set_sndtimeo(sock, 0);
+        rcon_sock_with_timeout = sock;
+        DebugPrint("zmq RCON send timeout set to 0.\n");
+    }
+
+    ZMQ_RconBroadcast(text);
+
+    rcon_broadcast_held = 0;
+    __atomic_clear(&rcon_broadcast_active, __ATOMIC_RELEASE);
+}
+
+// Releases a broadcast guard the calling thread still holds, in case a longjmp skipped the normal
+// release above. Runs on the main thread from My_SV_SpawnServer, below the in-place deferral,
+// where the main thread is not broadcasting. A guard another thread holds has
+// rcon_broadcast_held == 0 on this thread and is left alone.
+static void RconBroadcastGuardRecover(void) {
+    if (rcon_broadcast_held) {
+        rcon_broadcast_held = 0;
+        __atomic_clear(&rcon_broadcast_active, __ATOMIC_RELEASE);
+    }
+}
+
+// Removes up to RCON_DRAIN_MAX leftover frames from the socket with ZMQ_DONTWAIT reads. Returns 1
+// if the socket reached a message boundary (no more frames queued), 0 if the cap was reached with
+// frames still queued. A per-call cap bounds the work; the caller runs the cap again next frame.
+#define RCON_DRAIN_MAX 64
+static int RconDrainToBoundary(void* raw, void* zsock) {
+    for (int i = 0; i < RCON_DRAIN_MAX; i++) {
+        if (!zsock_rcvmore(zsock)) {
+            return 1;
+        }
+        void* msg[8]; // zmq_msg_t is 32 bytes in this libzmq; 64 pointer-aligned bytes are safe.
+        if (zmq_msg_init(msg)) {
+            return 0;
+        }
+        int n = zmq_recvmsg(raw, msg, 1 /* ZMQ_DONTWAIT */);
+        zmq_msg_close(msg);
+        if (n < 0) {
+            // EAGAIN means nothing is buffered. EINTR or ETERM can return before the read, with a
+            // frame still queued, so report a boundary only when no frame remains.
+            return !zsock_rcvmore(zsock);
+        }
+    }
+    return !zsock_rcvmore(zsock);
+}
+
+// My_ZMQ_RconReceive keeps each call to the engine's receive at a message boundary. The pre-drain
+// discards any frames a previous call left, so the receive does not start mid-message; if the
+// per-call cap cannot reach a boundary, it skips the receive and continues next frame. The
+// post-drain discards any frames left after the receive. Main thread only, the same thread the
+// receive runs on.
+void __cdecl My_ZMQ_RconReceive(void) {
+    void* zsock = *zmq_rcon_sock;
+    void* raw = zsock ? zsock_resolve(zsock) : NULL;
+    if (!raw) {
+        ZMQ_RconReceive(); // cannot drain: run the engine's own behaviour
+        return;
+    }
+    if (zsock_rcvmore(zsock) && !RconDrainToBoundary(raw, zsock)) {
+        return; // still mid-message after the cap; do not start the original here
+    }
+    ZMQ_RconReceive();
+    RconDrainToBoundary(raw, zsock);
 }
 
 // Hook static functions. Can be done before program even runs.
@@ -801,6 +932,22 @@ void HookStatic(void) {
     if (res) {
         DebugPrint("ERROR: Failed to hook SV_SpawnServer: %d\n", res);
         failed = 1;
+    }
+
+    // Optional: without it the server runs as the engine ships, so a failure only warns.
+    if (ZMQ_RconBroadcast) {
+        res = Hook((void*)ZMQ_RconBroadcast, My_ZMQ_RconBroadcast, (void*)&ZMQ_RconBroadcast);
+        if (res) {
+            DebugPrint("WARNING: Failed to hook ZMQ_RconBroadcast: %d\n", res);
+        }
+    }
+
+    // Optional: the RCON receive drain, same policy as the broadcast hook above.
+    if (ZMQ_RconReceive) {
+        res = Hook((void*)ZMQ_RconReceive, My_ZMQ_RconReceive, (void*)&ZMQ_RconReceive);
+        if (res) {
+            DebugPrint("WARNING: Failed to hook ZMQ_RconReceive: %d\n", res);
+        }
     }
 
     // ==============================

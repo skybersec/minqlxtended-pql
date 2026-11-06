@@ -1935,6 +1935,15 @@ typedef void(__cdecl *SV_UnlinkEntity_ptr)(sharedEntity_t *gEnt);
 typedef void(__cdecl *SV_SpawnServer_ptr)(char *server, qboolean killBots);
 typedef void(__cdecl *Cmd_ExecuteString_ptr)(const char *text);
 typedef int(__cdecl *idSteamServer_DownloadItem_ptr)(uint64_t workshopId, qboolean defer);
+typedef void(__cdecl *ZMQ_RconBroadcast_ptr)(const char *text);
+typedef void(__cdecl *zsock_set_sndtimeo_ptr)(void *self, int sndtimeo);
+typedef void(__cdecl *ZMQ_RconReceive_ptr)(void);
+typedef char *(__cdecl *zstr_recv_ptr)(void *source);
+typedef int(__cdecl *zsock_rcvmore_ptr)(void *self);
+typedef void *(__cdecl *zsock_resolve_ptr)(void *self);
+typedef int(__cdecl *zmq_msg_init_ptr)(void *msg);
+typedef int(__cdecl *zmq_recvmsg_ptr)(void *s, void *msg, int flags);
+typedef int(__cdecl *zmq_msg_close_ptr)(void *msg);
 
 // VM functions.
 typedef void(__cdecl *G_RunFrame_ptr)(int time);
@@ -1999,6 +2008,15 @@ extern Sys_IsLANAddress_ptr Sys_IsLANAddress;
 extern idSteamServer_DownloadItem_ptr idSteamServer_DownloadItem;
 extern SV_LinkEntity_ptr SV_LinkEntity;     // NULL if the pattern did not match
 extern SV_UnlinkEntity_ptr SV_UnlinkEntity; // NULL if the pattern did not match
+extern ZMQ_RconBroadcast_ptr ZMQ_RconBroadcast;   // NULL if the pattern did not match
+extern zsock_set_sndtimeo_ptr zsock_set_sndtimeo; // NULL if the pattern did not match
+extern void **zmq_rcon_sock;                     // the engine's zsock_t* slot; NULL if unresolved
+extern ZMQ_RconReceive_ptr ZMQ_RconReceive; // NULL if the receive drain set is incomplete
+extern zsock_rcvmore_ptr zsock_rcvmore;     // NULL if the receive drain set is incomplete
+extern zsock_resolve_ptr zsock_resolve;     // NULL if the receive drain set is incomplete
+extern zmq_msg_init_ptr zmq_msg_init;       // NULL if the receive drain set is incomplete
+extern zmq_recvmsg_ptr zmq_recvmsg;         // NULL if the receive drain set is incomplete
+extern zmq_msg_close_ptr zmq_msg_close;     // NULL if the receive drain set is incomplete
 
 // VM functions.
 extern G_RunFrame_ptr G_RunFrame;

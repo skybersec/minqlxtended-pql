@@ -84,6 +84,25 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define MASK_SV_LINKENTITY "XXXXXXXXXXXXXXXX----X----XXXXXXXX-XXXX----XXX----"
 #define PTRN_SV_UNLINKENTITY "\x53\x48\x89\xfb\xe8\x00\x00\x00\x00\xc7\x83\x00\x00\x00\x00\x00\x00\x00\x00\x48\x8b\x10\x48\x85\xd2\x74\x00\x48\xc7\x00\x00\x00\x00\x00\x48\x8b\x4a\x18\x48\x39\xc1\x74\x00\x48\x85\xc9\x74\x00"
 #define MASK_SV_UNLINKENTITY "XXXXX----XX----XXXXXXXXXXX-XXXXXXXXXXXXXXX-XXXX-"
+// Com_Printf's copy of each line to every registered zmq RCON client. The opening loads read the
+// RCON socket (see OFFSET_RELP_ZMQ_RCON_SOCK) and the client map.
+#define PTRN_ZMQ_RCONBROADCAST "\x41\x54\x55\x48\x89\xfd\x53\x48\x83\xec\x10\x48\x8b\x3d\x00\x00\x00\x00\x48\x85\xff\x0f\x84\x00\x00\x00\x00\x48\x8b\x1d\x00\x00\x00\x00\x48\x81\xfb\x00\x00\x00\x00\x75\x00\xe9\x00\x00\x00\x00\x48\x8b\x3d\x00\x00\x00\x00\x48\x89\xee\xe8\x00\x00\x00\x00"
+#define MASK_ZMQ_RCONBROADCAST "XXXXXXXXXXXXXX----XXXXX----XXX----XXX----X-X----XXX----XXXX----"
+// The statically linked czmq setter, never called by the engine. The \xbe\x1c\x00\x00\x00 is
+// `mov esi, ZMQ_SNDTIMEO` (28); every czmq setter has this shape, so those bytes are must-match.
+#define PTRN_ZSOCK_SET_SNDTIMEO "\x48\x83\xec\x18\x48\x85\xff\x89\x74\x24\x0c\x74\x00\xe8\x00\x00\x00\x00\x48\x8d\x54\x24\x0c\xb9\x04\x00\x00\x00\xbe\x1c\x00\x00\x00\x48\x89\xc7\xe8\x00\x00\x00\x00\x85\xc0\x75\x00\x48\x83\xc4\x18\xc3"
+#define MASK_ZSOCK_SET_SNDTIMEO "XXXXXXXXXXXX-X----XXXXXXXXXXXXXXXXXXX----XXX-XXXXX"
+// The RCON receive, the hook target. The opening loads test the socket and its raw handle; the
+// pattern pins that prologue.
+#define PTRN_ZMQ_RCONRECEIVE "\x48\x83\x3d\x00\x00\x00\x00\x00\x0f\x84\x00\x00\x00\x00\x48\x8b\x05\x00\x00\x00\x00\x48\x85\xc0\x0f\x84\x00\x00\x00\x00\x41\x55\xb9\x01\x00\x00\x00\x31\xd2\xbe\x01\x00\x00\x00\x41\x54\x55\x53"
+#define MASK_ZMQ_RCONRECEIVE "XXX----XXX----XXX----XXXXX----XXXXXXXXXXXXXXXXXX"
+// The czmq frame reader the receive uses. OFFSET_CALL_* below read the primitives it calls.
+#define PTRN_ZSTR_RECV "\x55\x53\x48\x83\xec\x38\x64\x48\x8b\x04\x25\x28\x00\x00\x00\x48\x89\x44\x24\x28\x31\xc0\x48\x85\xff\x0f\x84\x00\x00\x00\x00\xe8\x00\x00\x00\x00\x48\x89\xe7\x48\x89\xc3\xe8\x00\x00\x00\x00\x31\xd2"
+#define MASK_ZSTR_RECV "XXXXXXXXXXXXXXXXXXXXXXXXXXX----X----XXXXXXX----XX"
+// The czmq more-frame query. `mov esi, ZMQ_RCVMORE` (13) is must-match; every czmq int getter
+// has this shape.
+#define PTRN_ZSOCK_RCVMORE "\x48\x83\xec\x18\x48\x85\xff\x74\x00\x48\xc7\x44\x24\x08\x04\x00\x00\x00\xe8\x00\x00\x00\x00\x48\x8d\x4c\x24\x08\x48\x8d\x54\x24\x04\xbe\x0d\x00\x00\x00\x48\x89\xc7\xe8\x00\x00\x00\x00\x8b\x44\x24\x04\x48\x83\xc4\x18\xc3"
+#define MASK_ZSOCK_RCVMORE "XXXXXXXX-XXXXXXXXXX----XXXXXXXXXXXXXXXXXXX----XXXXXXXXX"
 
 #define PTRN_G_ADDEVENT "\x85\xf6\x74\x00\x48\x8b\x8f\x00\x00\x00\x00\x48\x85\xc9\x74\x00\x8b\x81\x00\x00\x00\x00\x25\x00\x00\x00\x00\x05\x00\x00\x00\x00\x25\x00\x00\x00\x00\x09\xf0\x89\x81\x00\x00\x00\x00"
 #define MASK_G_ADDEVENT "XXX-XXX----XXXX-XX----X----X----X----XXXX----"
@@ -170,6 +189,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // server structs
 #define OFFSET_PP_SVS ((pint)SV_Shutdown + 0xAC)
 #define OFFSET_PP_SV_CONFIGSTRINGS ((pint)SV_GetConfigstring + 0x1C)
+
+// The zsock_t* of the zmq RCON socket, from the broadcast's opening `mov rdi, [rip+disp32]`
+// (48 8b 3d at +0x0B). The instruction ends right after the displacement, so the RELP formula
+// holds. Hook() overwrites these bytes, so read them first.
+#define OFFSET_RELP_ZMQ_RCON_SOCK ((pint)ZMQ_RconBroadcast + 0x0E)
+
+// The czmq and libzmq primitives for the RCON receive drain, derived from the `call rel32`
+// opcodes inside zstr_recv. Each offset points at the 0xE8 byte; the target is the displacement
+// plus the address plus 5. zstr_recv itself is never hooked, so these bytes stay put.
+#define OFFSET_CALL_ZSOCK_RESOLVE ((pint)zstr_recv + 0x1F)
+#define OFFSET_CALL_ZMQ_MSG_INIT  ((pint)zstr_recv + 0x2A)
+#define OFFSET_CALL_ZMQ_RECVMSG   ((pint)zstr_recv + 0x37)
+#define OFFSET_CALL_ZMQ_MSG_CLOSE ((pint)zstr_recv + 0x79)
 
 // VM_Call table offsets. See gameExport_t in quake_common.h for the whole ordering.
 #define RELOFFSET_VM_CALL_SHUTDOWNGAME 0x0
